@@ -359,7 +359,7 @@ void my_kmem_cache_free(struct my_kmem_cache_t *cachep, void *objp) {
 }
 ```
 ###### 测试文本
-在kern_init中我们加入一个slub_init函数对我定义的11个cache先初始化一下，知识确定其object的大小：
+在kern_init中我们加入一个slub_init函数对我定义的11个cache先初始化一下，只是确定其object的大小：
 ```
 void slub_init()
 {
@@ -367,15 +367,11 @@ void slub_init()
     
     for (size_t i = 0; i < MAX_CACHES; i++) {
         cache_pool[i].objsize = sizes[i];
-        /*cache_pool[i].num_objs = (PAGE_SIZE - sizeof(struct slab_t)) / sizes[i];
-        list_init(&cache_pool[i].slabs_full);
-        list_init(&cache_pool[i].slabs_partial);
-        list_init(&cache_pool[i].slabs_free);*/
 	}
     check_slub();
 }
 ```
-`check_slub`:测试岩本
+`check_slub`:测试样本
 ```
 static void check_slub()
 {  
