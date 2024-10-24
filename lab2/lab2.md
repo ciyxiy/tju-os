@@ -133,6 +133,456 @@ Buddy System算法把系统中的可用存储空间划分为存储块(Block)来�
 
 - 参考[伙伴分配器的一个极简实现](http://coolshell.cn/articles/10427.html)， 在ucore中实现buddy system分配算法，要求有比较充分的测试用例说明实现的正确性，需要有设计文档。
 
+### 算法原理：
+
+Buddy System算法，也称为伙伴系统算法，是一种用于内存分配和管理的算法。它的核心思想是将内存分割成2的幂次大小的块，并通过合并和分割这些块来满足内存分配和释放的需求。
+
+- 内存分割：内存被分割成多个大小为2的幂次方的块，每个大小的块都维护在一个空闲链表中。
+
+- 内存分配：当需要分配内存时，算法会找到能够满足需求的最小空闲块。如果找到的块比需求大，它会将这个块分割成两个大小相等的“伙伴”块，然后继续这个过程直到找到合适大小的块或者到达最小块大小。
+
+- 内存释放：当释放内存时，系统会检查释放的块的伙伴是否也是空闲的，如果是，则将它们合并成更大的块，这个过程会递归进行，直到无法合并为止。
+
+### 初始化
+
+该板块包含的函数负责在系统启动时初始化内存管理器所需的数据结构和内存映射。
+
+#### 初始化Buddy System (buddy_init)
+
+设置空闲内存列表和空闲内存数量，是内存管理系统启动时的第一个调用点：
+
+```c
+static void buddy_init(void) {
+    list_init(&free_list); // 初始化空闲列表
+    nr_free = 0; // 重置可用内存计数
+}
+
+```
+
+#### 初始化二叉树节点 (buddy2_new)
+
+根据提供的总内存大小，构建一个二叉树结构，每个节点代表一个可能的内存块。节点的大小是2的幂次方：
+
+```c
+void buddy2_new(int size) {
+    unsigned node_size;
+    int i;
+    nr_block = 0; // 重置已分配块数
+    if (size < 1 || !IS_POWER_OF_2(size)) // 检查规格是否正确
+        return;
+
+    root[0].size = size; // 设置根节点大小
+    node_size = size * 2; // 计算节点的大小
+
+    for (i = 0; i < 2 * size - 1; ++i) 
+    {
+        if (IS_POWER_OF_2(i + 1))
+            node_size /= 2; // 更新节点大小
+        root[i].len = node_size; // 设置当前节点长度
+    }
+}
+
+```
+
+#### 初始化内存映射 (buddy_init_memmap)
+
+将物理内存页映射到操作系统的内存管理结构中，初始化每个页面的状态，并将其加入到空闲列表中。
+
+```c
+static void buddy_init_memmap(struct Page *base, size_t n) {
+    assert(n > 0); // 确保n大于0
+    n = UINT32_ROUND_DOWN(n); // 向下取整为2的幂
+    // 检查页面的使用情况
+    struct Page *p = page_base = base;
+    for (; p != base + n; p++) 
+    {
+        assert(PageReserved(p)); // 确保页面被保留
+        p->flags = p->property = 0; // 清空标志和属性
+        set_page_ref(p, 0); // 设定页面引用为0
+    }
+    base->property = n; // 设置基页的属性
+    SetPageProperty(base); // 设定基页的属性状态
+    nr_free += n; // 更新空闲页面计数
+
+    list_add(&free_list, &(base->page_link)); // 将基页添加到空闲列表
+    buddy2_new(n); // 初始化新的伙伴系统
+}
+
+```
+
+### 内存分配
+
+这个板块包含的函数负责处理内存分配请求，处理来自操作系统或其他模块的内存分配请求。
+
+#### 内存分配 (buddy2_alloc)
+
+遍历二叉树，寻找足够大的空闲内存块来满足请求。如果需要，会分裂较大的内存块以匹配请求的大小，并更新树结构。
+
+```c
+void buddy2_alloc(struct buddy2* root, int size, int* page_num, int* parent_page_num) {
+    unsigned index = 0; // 节点的标号
+    unsigned node_size;
+
+    if (root == NULL) // 无法进行分配
+        return;
+
+    if (size <= 0) // 分配请求不合理
+        return;
+    if (!IS_POWER_OF_2(size)) // 如果不是2的幂，取比size更大的2的n次幂
+        size = fixsize(size);
+
+    if (root[index].len < size) // 可分配内存不足
+        return;
+
+    // 逐步寻找合适的节点进行分配
+    for (node_size = root->size; node_size != size; node_size /= 2) 
+    {
+        int page_num = (index + 1) * node_size - root->size; // 计算页偏移
+        struct Page *left_page = page_base + page_num; // 左子页
+        struct Page *right_page = left_page + node_size / 2; // 右子页
+        // 分裂节点
+        if (left_page->property == node_size && PageProperty(left_page)) // 只有当整块大页都是空闲页时，才进行分裂
+        {
+            left_page->property /= 2; // 更新左子页的属性
+            right_page->property = left_page->property; // 更新右子页的属性
+            SetPageProperty(right_page); // 设置右子页的属性
+        }
+
+        // 选择下一个子节点
+        if (root[LEFT_LEAF(index)].len >= size && root[RIGHT_LEAF(index)].len >= size)
+        {
+            index = root[LEFT_LEAF(index)].len <= root[RIGHT_LEAF(index)].len ? LEFT_LEAF(index) : RIGHT_LEAF(index); // 选择更小子节点
+        }
+        else
+        {
+            index = root[LEFT_LEAF(index)].len < root[RIGHT_LEAF(index)].len ? RIGHT_LEAF(index) : LEFT_LEAF(index); // 选择更小子节点
+        }
+    }
+
+    root[index].len = 0; // 标记节点为已使用
+    // 页上的偏移，表示第几个页
+    *page_num = (index + 1) * node_size - root->size; // 当前页的编号
+    *parent_page_num = (PARENT(index) + 1) * node_size * 2 - root->size; // 父页的编号
+
+    // 向上刷新，修改先祖节点的值
+    while (index) 
+    {
+        index = PARENT(index); // 逐级向上遍历
+        root[index].len = MAX(root[LEFT_LEAF(index)].len, root[RIGHT_LEAF(index)].len); // 更新节点长度
+    }
+}
+```
+
+#### 分配页面 (buddy_alloc_pages)
+
+处理具体的内存分配请求，调用buddy2_alloc来找到和分配内存。
+
+同时，。更新操作系统的内存管理数据结构，如空闲列表和空闲内存计数器，确保内存状态的准确性
+```c
+static struct Page *
+buddy_alloc_pages(size_t n) 
+{
+    // 确保n大于0
+    assert(n > 0);
+    // 确保n小于剩余可用块数
+    if (n > nr_free)
+        return NULL;
+    // 确保n是2的整数次幂
+    if (!IS_POWER_OF_2(n))
+        n = fixsize(n);
+    
+    // 要分配的页面以及父页面
+    struct Page *page, *parent_page;
+    // 页的序号
+    int page_num, parent_page_num;
+
+    // 分配页面
+    buddy2_alloc(root, n, &page_num, &parent_page_num);
+
+    // 从计算的页开始分配
+    page = page_base + page_num;
+    parent_page = page_base + parent_page_num;
+
+    // 记录已分配块数
+    nr_block++;
+
+    // 检查是否还有剩余
+    if (page->property != n) // 还有剩余
+    {
+        if (page == parent_page) // 若page是parent_page的左孩子
+        {
+            // 将右节点连入链表
+            struct Page *right_page = page + n; // 右子页面
+            right_page->property = n; // 设置右子页面属性
+            list_entry_t *prev = list_prev(&(page->page_link)); // 获取前一个节点
+            list_del(&page->page_link); // 从链表中删除当前页面
+            list_add(prev, &(right_page->page_link)); // 将右子页面加入链表
+            SetPageProperty(right_page); // 设置右子页面属性
+        }
+        else // 若page是parent_page的右孩子
+        {
+            // 更改左节点的property
+            parent_page->property /= 2; // 将父页面属性减半
+        }
+    }
+    else // 表示已全部分配
+    {
+        list_del(&page->page_link); // 从链表中删除已分配页面
+    }
+
+    ClearPageProperty(page); // 清除页面属性
+
+    nr_free -= n; // 减去已分配的页数
+    return page; // 返回分配的页面
+}
+```
+
+### 内存释放
+
+处理内存释放请求，将内存返回给系统，并尝试优化内存布局。
+
+#### 释放页面 (buddy_free_pages)
+
+将不再需要的内存块返回给系统，并通过伙伴系统树与相邻的空闲内存块合并，以减少内存碎片。
+```c
+// 释放base开始的n个页面
+static void
+buddy_free_pages(struct Page *base, size_t n) {
+    assert(n > 0); // 确保n大于0
+    if (!IS_POWER_OF_2(n)) { // 确保n是2的幂
+        n = fixsize(n);
+    }
+    
+    assert(base >= page_base && base < page_base + root->size); // 确保base在有效范围内
+
+    // 计算分段数量以及页号
+    int div_seg_num = root->size / n; // 被分割的段数量
+    int page_num = base - page_base; // 当前页的页号
+    assert(page_num % n == 0); // 确保在分位点上
+
+    // 检查页面的状态并重置
+    struct Page *p = base;
+    for (; p != base + n; p++) {
+        assert(!PageReserved(p) && !PageProperty(p)); // 检查页面是否被保留且未占用
+        p->flags = 0; // 清空页面标志
+        set_page_ref(p, 0); // 设置页面引用为0
+    }
+    base->property = n; // 设置基页面的属性
+    SetPageProperty(base); // 设置基页面属性
+    nr_free += n; // 增加空闲页面计数
+
+    // 如果空闲列表为空，直接加入
+    if (list_empty(&free_list)) {
+        list_add(&free_list, &(base->page_link)); // 将基页面加入空闲列表
+    } else {
+        // 计算对应的树节点索引
+        int buddy_index = root->size - 1 + page_num; // 该页所对应的树节点
+        int node_size = n; // 当前节点大小
+        root[buddy_index].len = n;
+        // 向上合并
+        while (buddy_index) {
+            buddy_index = PARENT(buddy_index); // 向上获取父节点
+            node_size *= 2; // 更新节点大小
+            int left_longest = root[LEFT_LEAF(buddy_index)].len; // 左子节点的长度
+            int right_longest = root[RIGHT_LEAF(buddy_index)].len; // 右子节点的长度
+
+            // 如果左右节点可以合并
+            if (left_longest + right_longest == node_size) { // 进行合并
+                root[buddy_index].len = node_size; // 更新父节点长度
+                int left_page_num = (LEFT_LEAF(buddy_index) + 1) * node_size / 2 - root->size; // 左边的页号
+                int right_page_num = (RIGHT_LEAF(buddy_index) + 1) * node_size / 2 - root->size; // 右边的页号
+                struct Page *left_page = page_base + left_page_num; // 左子页面
+                struct Page *right_page = page_base + right_page_num; // 右子页面
+
+                // 检查左子页面是否在空闲列表中
+                if (!in_freelist(left_page)) {
+                    list_add_before(&(right_page->page_link), &(left_page->page_link)); // 将右子页面插入左子页面之前
+                }
+                // 检查右子页面是否在空闲列表中
+                if (!in_freelist(right_page)) {
+                    list_add(&(left_page->page_link), &(right_page->page_link)); // 将左子页面添加到空闲列表
+                }
+                // 合并两个节点
+                left_page->property += right_page->property; // 更新左子页面属性
+                right_page->property = 0; // 清空右子页面属性
+                list_del(&right_page->page_link); // 从链表中删除右子页面
+                ClearPageProperty(right_page); // 清空右子页面属性
+            } else { // 如果没有合并，更新节点长度
+                root[buddy_index].len = MAX(left_longest, right_longest);
+            }
+        }
+    }
+    cprintf("内存释放完成\n");
+}
+
+```
+
+### 辅助函数
+
+#### 检查页面是否在空闲列表中 (in_freelist)
+
+```c
+int in_freelist(struct Page* p)
+{
+    if (list_prev(&p->page_link) == NULL) // 不在空闲列表中
+        return 0;
+
+    return list_next(list_prev(&p->page_link)) == &p->page_link; // 检查是否为第一个节点
+}
+```
+
+#### 获取当前空闲页面的数量 (buddy_nr_free_pages)
+
+```c
+static size_t
+buddy_nr_free_pages(void) {
+    return nr_free;// 返回剩余空闲页面数
+}
+```
+
+### 验证输出
+
+#### 测试样例
+
+```c
+static void buddy_check(void)
+{
+    cprintf("测试多次小规模分配与释放\n");
+    struct Page *p0, *p1, *p2, *p3;
+    p0 = p1 = p2 = p3 = NULL;
+
+    assert((p0 = alloc_pages(3)) != NULL);
+    assert((p1 = alloc_pages(2)) != NULL);
+    assert((p2 = alloc_pages(1)) != NULL);
+    assert((p3 = alloc_pages(5)) != NULL);
+
+    free_pages(p0, 3);
+    free_pages(p1, 2);
+    free_pages(p2, 1);
+    free_pages(p3, 5);
+
+    assert((p0 = alloc_pages(3)) != NULL);
+    assert((p1 = alloc_pages(2)) != NULL);
+    assert((p2 = alloc_pages(1)) != NULL);
+    assert((p3 = alloc_pages(5)) != NULL);
+
+    free_pages(p0, 3);
+    free_pages(p1, 2);
+    free_pages(p2, 1);
+    free_pages(p3, 5);
+    cprintf("成功完成\n");
+    
+    cprintf("测试大规模块分配与释放\n");
+    
+    assert((p0 = alloc_pages(128)) != NULL);
+    assert((p1 = alloc_pages(64)) != NULL);
+    assert((p2 = alloc_pages(256)) != NULL);
+
+    free_pages(p0, 128);
+    free_pages(p1, 64);
+    free_pages(p2, 256);
+
+    assert((p0 = alloc_pages(128)) != NULL);
+    assert((p1 = alloc_pages(64)) != NULL);
+    assert((p2 = alloc_pages(256)) != NULL);
+
+    free_pages(p0, 128);
+    free_pages(p1, 64);
+    free_pages(p2, 256);
+    cprintf("成功完成\n");
+    
+    cprintf("测试不同大小块的交替分配与释放\n");
+  
+    assert((p0 = alloc_pages(10)) != NULL);
+    assert((p1 = alloc_pages(20)) != NULL);
+    assert((p2 = alloc_pages(5)) != NULL);
+    assert((p3 = alloc_pages(8)) != NULL);
+
+    free_pages(p1, 20);
+    free_pages(p3, 8);
+
+    assert((p1 = alloc_pages(15)) != NULL);
+    free_pages(p0, 10);
+    free_pages(p1, 15);
+    free_pages(p2, 5);
+    cprintf("成功完成\n");
+}
+```
+
+#### 测试结果
+
+将 pmm_manager 改为 buddy_pmm_manager，并 make grade 进行测试，试验验证成功。
+
+输出如下：
+
+```c
+ys@ys-virtual-machine:~/Desktop/riscv64-ucore-labcodes/lab2$ make grade
+>>>>>>>>>> here_make>>>>>>>>>>>
+gmake[1]: Entering directory '/home/ys/Desktop/riscv64-ucore-labcodes/lab2' + cc kern/init/entry.S + cc kern/init/init.c + cc kern/libs/stdio.c + cc kern/debug/kdebug.c + cc kern/debug/kmonitor.c + cc kern/debug/panic.c + cc kern/driver/clock.c + cc kern/driver/console.c + cc kern/driver/intr.c + cc kern/trap/trap.c + cc kern/trap/trapentry.S + cc kern/mm/best_fit_pmm.c + cc kern/mm/buddy_pmm.c + cc kern/mm/default_pmm.c + cc kern/mm/pmm.c + cc libs/printfmt.c + cc libs/readline.c + cc libs/sbi.c + cc libs/string.c + ld bin/kernel riscv64-unknown-elf-objcopy bin/kernel --strip-all -O binary bin/ucore.img gmake[1]: Leaving directory '/home/ys/Desktop/riscv64-ucore-labcodes/lab2'
+>>>>>>>>>> here_make>>>>>>>>>>>
+<<<<<<<<<<<<<<< here_run_qemu <<<<<<<<<<<<<<<<<<
+try to run qemu
+qemu pid=56922
+<<<<<<<<<<<<<<< here_run_check <<<<<<<<<<<<<<<<<<
+  -check physical_memory_map_information:    OK
+  -check_best_fit:                           OK
+  -check ticks:                              OK
+Total Score: 30/30
+```
+
+make qemu输出如下：
+
+```c
+make qemu
++ cc kern/mm/buddy_pmm.c
++ ld bin/kernel
+riscv64-unknown-elf-objcopy bin/kernel --strip-all -O binary bin/ucore.img
+
+OpenSBI v0.4 (Jul  2 2019 11:53:53)
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name          : QEMU Virt Machine
+Platform HART Features : RV64ACDFIMSU
+Platform Max HARTs     : 8
+Current Hart           : 0
+Firmware Base          : 0x80000000
+Firmware Size          : 112 KB
+Runtime SBI Version    : 0.1
+
+PMP0: 0x0000000080000000-0x000000008001ffff (A)
+PMP1: 0x0000000000000000-0xffffffffffffffff (A,R,W,X)
+(THU.CST) os is loading ...
+Special kernel symbols:
+  entry  0xffffffffc0200032 (virtual)
+  etext  0xffffffffc0201a34 (virtual)
+  edata  0xffffffffc0206010 (virtual)
+  end    0xffffffffc0254680 (virtual)
+Kernel executable memory footprint: 338KB
+memory management: buddy_pmm_manager
+physcial memory map:
+  memory: 0x0000000007e00000, [0x0000000080200000, 0x0000000087ffffff].
+测试多次小规模分配与释放
+成功完成
+测试大规模块分配与释放
+成功完成
+测试不同大小块的交替分配与释放
+成功完成
+check_alloc_page() succeeded!
+satp virtual address: 0xffffffffc0205000
+satp physical address: 0x0000000080205000
+++ setup timer interrupts
+100 ticks
+100 ticks
+...
+```
+
 #### 扩展练习Challenge：任意大小的内存单元slub分配算法（需要编程）
 
 slub算法，实现两层架构的高效内存单元分配，第一层是基于页大小的内存分配，第二层是在第一层基础上实现基于任意大小的内存分配。可简化实现，能够体现其主体思想即可。
